@@ -10,7 +10,6 @@ import os
 import subprocess
 from flask_cors import CORS
 import gc  # Import garbage collector
-import math
 
 app = Flask(__name__)
 # Enable CORS for all routes and all origins
@@ -28,7 +27,13 @@ app.config["TIMEOUT"] = 300  # 5 minutes instead of default 30 seconds
 def prepare_data(data):
     X = data["Day No."].values.reshape(-1, 1)
     y = data["Number of entries"].values
-    return train_test_split(X, y, test_size=0.2, random_state=42)
+
+    # Handle small datasets to prevent empty train sets
+    if len(X) <= 5:
+        # For very small datasets, use all data for both training and testing
+        return X, X, y, y
+    else:
+        return train_test_split(X, y, test_size=0.2, random_state=42)
 
 
 def train_and_predict(X_train, X_test, y_train, y_test, future_days=7):
@@ -50,10 +55,17 @@ def train_and_predict(X_train, X_test, y_train, y_test, future_days=7):
             model.fit(X_train, y_train)
             y_pred = model.predict(X_test)
             mse = mean_squared_error(y_test, y_pred)
+
+            # Determine the start index for future predictions
+            if np.array_equal(
+                X_train, X_test
+            ):  # If we used same data for train and test
+                start_idx = len(X_train)
+            else:
+                start_idx = len(X_train) + len(X_test)
+
             future_predictions = model.predict(
-                np.arange(
-                    len(X_train) + len(X_test), len(X_train) + len(X_test) + future_days
-                ).reshape(-1, 1)
+                np.arange(start_idx, start_idx + future_days).reshape(-1, 1)
             )
 
             # Explicitly clean up memory
@@ -66,10 +78,15 @@ def train_and_predict(X_train, X_test, y_train, y_test, future_days=7):
             model.fit(X_train, y_train)
             y_pred = model.predict(X_test)
             mse = mean_squared_error(y_test, y_pred)
+
+            # Same logic for future predictions in fallback case
+            if np.array_equal(X_train, X_test):
+                start_idx = len(X_train)
+            else:
+                start_idx = len(X_train) + len(X_test)
+
             future_predictions = model.predict(
-                np.arange(
-                    len(X_train) + len(X_test), len(X_train) + len(X_test) + future_days
-                ).reshape(-1, 1)
+                np.arange(start_idx, start_idx + future_days).reshape(-1, 1)
             )
 
         results[name] = {"mse": float(mse), "predictions": future_predictions.tolist()}
@@ -132,21 +149,29 @@ def create_batches(df, min_batches=10, max_rows_per_batch=1000):
     total_rows = len(df)
 
     # Calculate batch size
-    if total_rows <= max_rows_per_batch:
-        # If total rows is small, create at least min_batches
+    if total_rows <= min_batches:
+        # Not enough data to create min_batches, so return the full dataset as one batch
+        return [df]
+    elif total_rows <= max_rows_per_batch * min_batches:
+        # We have enough data for min_batches, but not enough for max_rows_per_batch in each
         batch_size = max(1, total_rows // min_batches)
     else:
-        # Otherwise limit to max_rows_per_batch
+        # We have lots of data, use max_rows_per_batch
         batch_size = max_rows_per_batch
 
-    # Ensure batch_size is at least 1
-    batch_size = max(1, batch_size)
+    # Ensure batch_size is at least 2 to avoid single-row batches
+    batch_size = max(2, batch_size)
 
     # Create batches
     batches = []
     for i in range(0, total_rows, batch_size):
         end_idx = min(i + batch_size, total_rows)
-        batches.append(df.iloc[i:end_idx].copy())
+        if end_idx - i > 1:  # Only create batch if it has at least 2 rows
+            batches.append(df.iloc[i:end_idx].copy())
+
+    # If no batches were created (edge case), return the full dataset
+    if not batches and total_rows > 0:
+        batches = [df]
 
     return batches
 
@@ -224,6 +249,10 @@ def predict():
         batch_predictions = []
 
         for batch, batch_name in zip(all_batches, all_batch_names):
+            # Skip empty batches (should not happen, but just in case)
+            if len(batch) == 0:
+                continue
+
             X_train, X_test, y_train, y_test = prepare_data(batch)
             results = train_and_predict(X_train, X_test, y_train, y_test)
             all_results.append(results)
@@ -235,6 +264,7 @@ def predict():
                     "batch_name": batch_name,
                     "results": results,
                     "xgb_average": float(xgb_avg),
+                    "row_count": len(batch),
                 }
             )
 
@@ -258,7 +288,11 @@ def predict():
         # Group results by original dataset
         dataset_results = {}
         for dataset_name in dataset_names:
-            dataset_results[dataset_name] = {"batches": [], "total_percentage": 0.0}
+            dataset_results[dataset_name] = {
+                "batches": [],
+                "total_percentage": 0.0,
+                "total_rows": 0,
+            }
 
         # Fill in batch results for each dataset
         for batch_pred in batch_predictions:
@@ -271,11 +305,13 @@ def predict():
                         "batch_name": batch_name,
                         "xgb_average": batch_pred["xgb_average"],
                         "percentage": batch_pred["percentage"],
+                        "row_count": batch_pred["row_count"],
                     }
                 )
                 dataset_results[dataset_name]["total_percentage"] += batch_pred[
                     "percentage"
                 ]
+                dataset_results[dataset_name]["total_rows"] += batch_pred["row_count"]
 
         # Prepare response
         response = {
