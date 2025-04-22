@@ -6,12 +6,8 @@ from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error
 from xgboost import XGBRegressor
-from lightgbm import LGBMRegressor
-from catboost import CatBoostRegressor
 import os
 import subprocess
-import tempfile
-import json
 from flask_cors import CORS
 import gc  # Import garbage collector
 import math
@@ -129,30 +125,30 @@ def run_buddy_allocation(percentages):
         return f"Error running BuddyAllocation: {e.stderr}"
 
 
-def slice_dataframe(df, max_slices=10, max_rows_per_slice=1000):
+def create_batches(df, min_batches=10, max_rows_per_batch=1000):
     """
-    Slice a dataframe into chunks, with a maximum of max_slices or
-    chunks of max_rows_per_slice rows, whichever results in smaller chunks.
+    Split dataframe into batches with at least min_batches or max_rows_per_batch rows per batch
     """
     total_rows = len(df)
 
-    # Calculate rows per slice based on max_slices
-    rows_per_slice_by_count = math.ceil(total_rows / max_slices)
+    # Calculate batch size
+    if total_rows <= max_rows_per_batch:
+        # If total rows is small, create at least min_batches
+        batch_size = max(1, total_rows // min_batches)
+    else:
+        # Otherwise limit to max_rows_per_batch
+        batch_size = max_rows_per_batch
 
-    # Choose the smaller slice size between the two options
-    rows_per_slice = min(rows_per_slice_by_count, max_rows_per_slice)
+    # Ensure batch_size is at least 1
+    batch_size = max(1, batch_size)
 
-    # Calculate the actual number of slices
-    num_slices = math.ceil(total_rows / rows_per_slice)
+    # Create batches
+    batches = []
+    for i in range(0, total_rows, batch_size):
+        end_idx = min(i + batch_size, total_rows)
+        batches.append(df.iloc[i:end_idx].copy())
 
-    slices = []
-    for i in range(num_slices):
-        start_idx = i * rows_per_slice
-        end_idx = min((i + 1) * rows_per_slice, total_rows)
-        slice_df = df.iloc[start_idx:end_idx].copy()
-        slices.append(slice_df)
-
-    return slices
+    return batches
 
 
 @app.route("/predict", methods=["POST"])
@@ -180,12 +176,11 @@ def predict():
                 400,
             )
 
-        all_results = []
+        datasets = []
         dataset_names = []
-        slice_averages = []
 
         # Process each dataset from the request
-        for dataset_index, dataset_obj in enumerate(data):
+        for dataset_obj in data:
             if "name" not in dataset_obj or "data" not in dataset_obj:
                 return (
                     jsonify(
@@ -198,13 +193,10 @@ def predict():
             dataset_data = dataset_obj["data"]
 
             # Convert to pandas DataFrame
-            original_df = pd.DataFrame(dataset_data)
+            df = pd.DataFrame(dataset_data)
 
             # Validate required columns
-            if (
-                "Day No." not in original_df.columns
-                or "Number of entries" not in original_df.columns
-            ):
+            if "Day No." not in df.columns or "Number of entries" not in df.columns:
                 return (
                     jsonify(
                         {
@@ -214,81 +206,82 @@ def predict():
                     400,
                 )
 
-            # Slice the dataset
-            df_slices = slice_dataframe(
-                original_df, max_slices=10, max_rows_per_slice=1000
-            )
+            datasets.append(df)
+            dataset_names.append(name)
 
-            # Process each slice
-            dataset_results = []
-            slice_xgb_avgs = []
+        # Create batches for each dataset
+        all_batches = []
+        all_batch_names = []
 
-            for slice_index, slice_df in enumerate(df_slices):
-                slice_name = f"{name}_slice_{slice_index+1}"
+        for i, (dataset, name) in enumerate(zip(datasets, dataset_names)):
+            batches = create_batches(dataset)
+            for j, batch in enumerate(batches):
+                all_batches.append(batch)
+                all_batch_names.append(f"{name}_batch_{j+1}")
 
-                # Process this slice
-                X_train, X_test, y_train, y_test = prepare_data(slice_df)
-                slice_result = train_and_predict(X_train, X_test, y_train, y_test)
+        # Process batches and make predictions
+        all_results = []
+        batch_predictions = []
 
-                # Store results for this slice
-                dataset_results.append(
-                    {
-                        "slice": slice_index + 1,
-                        "row_count": len(slice_df),
-                        "results": slice_result,
-                    }
-                )
+        for batch, batch_name in zip(all_batches, all_batch_names):
+            X_train, X_test, y_train, y_test = prepare_data(batch)
+            results = train_and_predict(X_train, X_test, y_train, y_test)
+            all_results.append(results)
 
-                # Store XGBoost average for this slice
-                slice_xgb_avg = np.mean(slice_result["XGBoost"]["predictions"])
-                slice_xgb_avgs.append(slice_xgb_avg)
-
-                # Force garbage collection after each slice
-                gc.collect()
-
-            # Calculate overall average for this dataset
-            dataset_xgb_avg = np.mean(slice_xgb_avgs)
-
-            # Store results for this dataset
-            all_results.append(
+            # Calculate XGBoost average for this batch
+            xgb_avg = np.mean(results["XGBoost"]["predictions"])
+            batch_predictions.append(
                 {
-                    "dataset_name": name,
-                    "slice_count": len(df_slices),
-                    "total_rows": len(original_df),
-                    "slice_results": dataset_results,
-                    "xgb_average": float(dataset_xgb_avg),
+                    "batch_name": batch_name,
+                    "results": results,
+                    "xgb_average": float(xgb_avg),
                 }
             )
 
-            dataset_names.append(name)
-            slice_averages.append(dataset_xgb_avg)
-
-            # Force garbage collection after each dataset
+            # Force garbage collection after each batch
             gc.collect()
 
-        # Calculate percentages
-        total_sum = sum(slice_averages)
+        # Calculate percentages for all batches
+        xgb_averages = [pred["xgb_average"] for pred in batch_predictions]
+        total_sum = sum(xgb_averages)
         percentages = [
-            (avg / total_sum) * 100 if total_sum > 0 else 0 for avg in slice_averages
+            (avg / total_sum) * 100 if total_sum > 0 else 0 for avg in xgb_averages
         ]
 
-        # Run BuddyAllocation if available
+        # Add percentages to batch predictions
+        for i, percentage in enumerate(percentages):
+            batch_predictions[i]["percentage"] = float(percentage)
+
+        # Run BuddyAllocation with these percentages
         buddy_output = run_buddy_allocation(percentages)
+
+        # Group results by original dataset
+        dataset_results = {}
+        for dataset_name in dataset_names:
+            dataset_results[dataset_name] = {"batches": [], "total_percentage": 0.0}
+
+        # Fill in batch results for each dataset
+        for batch_pred in batch_predictions:
+            batch_name = batch_pred["batch_name"]
+            dataset_name = batch_name.split("_batch_")[0]
+
+            if dataset_name in dataset_results:
+                dataset_results[dataset_name]["batches"].append(
+                    {
+                        "batch_name": batch_name,
+                        "xgb_average": batch_pred["xgb_average"],
+                        "percentage": batch_pred["percentage"],
+                    }
+                )
+                dataset_results[dataset_name]["total_percentage"] += batch_pred[
+                    "percentage"
+                ]
 
         # Prepare response
         response = {
             "datasets": dataset_names,
-            "predictions": [
-                {
-                    "dataset": name,
-                    "xgb_average": float(xgb_avg),
-                    "percentage": float(pct),
-                    "detailed_results": result,
-                }
-                for name, result, xgb_avg, pct in zip(
-                    dataset_names, all_results, slice_averages, percentages
-                )
-            ],
+            "batch_predictions": batch_predictions,
+            "dataset_summaries": dataset_results,
             "buddy_allocation_output": buddy_output,
         }
 
@@ -298,7 +291,10 @@ def predict():
         return jsonify(response)
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        import traceback
+
+        trace = traceback.format_exc()
+        return jsonify({"error": str(e), "traceback": trace}), 500
 
 
 # Add at the very end of your app.py file
