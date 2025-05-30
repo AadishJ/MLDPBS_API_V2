@@ -189,11 +189,11 @@ int main()
         printf("Using default block sizes\n");
 
         // Use default block sizes
-        int default_block_sizes[] = {482, 360, 6};
+        int default_block_sizes[] = {100, 0, 0};
         int block_size_count = 3;
 
         BuddyAllocator allocator;
-        init(&allocator, 482); // Initialize with the largest block size
+        init(&allocator, 100); // Initialize with the largest block size
 
         pthread_t threads[NUM_THREADS];
         ThreadData thread_data[NUM_THREADS];

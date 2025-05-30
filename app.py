@@ -9,7 +9,7 @@ from xgboost import XGBRegressor
 import os
 import subprocess
 from flask_cors import CORS
-import gc  # Import garbage collector
+import gc  
 
 app = Flask(__name__)
 # Enable CORS for all routes and all origins
@@ -235,89 +235,126 @@ def predict():
             dataset_names.append(name)
 
         # Create batches for each dataset
-        all_batches = []
-        all_batch_names = []
+        all_dataset_batches = []
+        max_batches = 0
 
         for i, (dataset, name) in enumerate(zip(datasets, dataset_names)):
             batches = create_batches(dataset)
-            for j, batch in enumerate(batches):
-                all_batches.append(batch)
-                all_batch_names.append(f"{name}_batch_{j+1}")
+            all_dataset_batches.append({"dataset_name": name, "batches": batches})
+            max_batches = max(max_batches, len(batches))
 
         # Process batches and make predictions
-        all_results = []
         batch_predictions = []
 
-        for batch, batch_name in zip(all_batches, all_batch_names):
-            # Skip empty batches (should not happen, but just in case)
-            if len(batch) == 0:
-                continue
+        # Group batches by batch number (batch_1, batch_2, etc.)
+        batch_groups = {}
 
-            X_train, X_test, y_train, y_test = prepare_data(batch)
-            results = train_and_predict(X_train, X_test, y_train, y_test)
-            all_results.append(results)
+        for dataset_info in all_dataset_batches:
+            dataset_name = dataset_info["dataset_name"]
+            batches = dataset_info["batches"]
 
-            # Calculate XGBoost average for this batch
-            xgb_avg = np.mean(results["XGBoost"]["predictions"])
-            batch_predictions.append(
+            for batch_idx, batch in enumerate(batches):
+                batch_number = batch_idx + 1
+                batch_key = f"batch_{batch_number}"
+
+                if batch_key not in batch_groups:
+                    batch_groups[batch_key] = []
+
+                # Skip empty batches
+                if len(batch) == 0:
+                    continue
+
+                X_train, X_test, y_train, y_test = prepare_data(batch)
+                results = train_and_predict(X_train, X_test, y_train, y_test)
+
+                # Calculate XGBoost average for this batch
+                xgb_avg = np.mean(results["XGBoost"]["predictions"])
+
+                batch_groups[batch_key].append(
+                    {
+                        "dataset_name": dataset_name,
+                        "batch_name": f"{dataset_name}_batch_{batch_number}",
+                        "results": results,
+                        "xgb_average": float(xgb_avg),
+                        "row_count": len(batch),
+                    }
+                )
+
+                # Force garbage collection after each batch
+                gc.collect()
+
+        # Calculate combined XGBoost averages for each batch group
+        combined_batch_results = []
+        batch_group_averages = []
+
+        for batch_key in sorted(
+            batch_groups.keys(), key=lambda x: int(x.split("_")[1])
+        ):
+            batch_data = batch_groups[batch_key]
+
+            # Calculate weighted average across all datasets for this batch number
+            total_weighted_sum = 0.0
+            total_rows = sum(item["row_count"] for item in batch_data)
+
+            for item in batch_data:
+                weight = item["row_count"] / total_rows if total_rows > 0 else 0
+                total_weighted_sum += item["xgb_average"] * weight
+
+            combined_batch_results.append(
                 {
-                    "batch_name": batch_name,
-                    "results": results,
-                    "xgb_average": float(xgb_avg),
-                    "row_count": len(batch),
+                    "batch_group": batch_key,
+                    "datasets_in_batch": [item["dataset_name"] for item in batch_data],
+                    "combined_xgb_average": float(total_weighted_sum),
+                    "total_rows": total_rows,
+                    "individual_batches": batch_data,
                 }
             )
 
-            # Force garbage collection after each batch
-            gc.collect()
+            batch_group_averages.append(total_weighted_sum)
 
-        # Calculate percentages for all batches
-        xgb_averages = [pred["xgb_average"] for pred in batch_predictions]
-        total_sum = sum(xgb_averages)
-        percentages = [
-            (avg / total_sum) * 100 if total_sum > 0 else 0 for avg in xgb_averages
+        # Calculate percentages for batch groups (should add up to 100%)
+        total_sum = sum(batch_group_averages)
+        batch_group_percentages = [
+            (avg / total_sum) * 100 if total_sum > 0 else 0
+            for avg in batch_group_averages
         ]
 
-        # Add percentages to batch predictions
-        for i, percentage in enumerate(percentages):
-            batch_predictions[i]["percentage"] = float(percentage)
+        # Add percentages to combined batch results
+        for i, percentage in enumerate(batch_group_percentages):
+            combined_batch_results[i]["percentage"] = float(percentage)
 
-        # Run BuddyAllocation with these percentages
-        buddy_output = run_buddy_allocation(percentages)
+        # Run BuddyAllocation with batch group percentages
+        buddy_output = run_buddy_allocation(batch_group_percentages)
 
-        # Group results by original dataset
-        dataset_results = {}
+        # Create dataset summary showing which batches each dataset contributes to
+        dataset_summary = {}
         for dataset_name in dataset_names:
-            dataset_results[dataset_name] = {
-                "batches": [],
-                "total_percentage": 0.0,
-                "total_rows": 0,
-            }
+            dataset_summary[dataset_name] = {"total_rows": 0, "batch_contributions": []}
 
-        # Fill in batch results for each dataset
-        for batch_pred in batch_predictions:
-            batch_name = batch_pred["batch_name"]
-            dataset_name = batch_name.split("_batch_")[0]
-
-            if dataset_name in dataset_results:
-                dataset_results[dataset_name]["batches"].append(
+        # Fill dataset summary
+        for batch_result in combined_batch_results:
+            for individual_batch in batch_result["individual_batches"]:
+                dataset_name = individual_batch["dataset_name"]
+                dataset_summary[dataset_name]["total_rows"] += individual_batch[
+                    "row_count"
+                ]
+                dataset_summary[dataset_name]["batch_contributions"].append(
                     {
-                        "batch_name": batch_name,
-                        "xgb_average": batch_pred["xgb_average"],
-                        "percentage": batch_pred["percentage"],
-                        "row_count": batch_pred["row_count"],
+                        "batch_group": batch_result["batch_group"],
+                        "row_count": individual_batch["row_count"],
+                        "xgb_average": individual_batch["xgb_average"],
                     }
                 )
-                dataset_results[dataset_name]["total_percentage"] += batch_pred[
-                    "percentage"
-                ]
-                dataset_results[dataset_name]["total_rows"] += batch_pred["row_count"]
 
         # Prepare response
         response = {
             "datasets": dataset_names,
-            "batch_predictions": batch_predictions,
-            "dataset_summaries": dataset_results,
+            "batch_groups": combined_batch_results,
+            "dataset_summary": dataset_summary,
+            "allocation_summary": {
+                batch_result["batch_group"]: batch_result["percentage"]
+                for batch_result in combined_batch_results
+            },
             "buddy_allocation_output": buddy_output,
         }
 
