@@ -287,6 +287,99 @@ def process_batch(batch_info):
             'dataset_results': error_dataset_results
         }
 
+def parse_system_info_from_output(output_text):
+    """Parse system information from the C program output."""
+    lines = output_text.split('\n')
+    system_info = {}
+    in_system_info = False
+    
+    for line in lines:
+        line = line.strip()
+        if line == "SYSTEM_INFO_START":
+            in_system_info = True
+        elif line == "SYSTEM_INFO_END":
+            in_system_info = False
+        elif in_system_info and "=" in line:
+            key, value = line.split("=", 1)
+            try:
+                system_info[key] = int(value)
+            except ValueError:
+                system_info[key] = value
+    
+    return system_info
+
+
+def run_buddy_allocation(percentages, entry_sizes, batch_number=1):
+    """Run the BuddyAllocation program with the given percentages and entry sizes."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    buddy_executable = os.path.join(script_dir, "BuddyAllocation")
+
+    # Create a predictions directory if it doesn't exist
+    predictions_dir = os.path.join(script_dir, "predictions")
+    os.makedirs(predictions_dir, exist_ok=True)
+
+    # Create the percentages file with both percentages and block sizes
+    percentages_file = os.path.join(predictions_dir, f"percentages_batch_{batch_number}.txt")
+    with open(percentages_file, "w") as f:
+        # Write percentages first
+        for percentage in percentages:
+            f.write(f"{percentage:.2f}\n")
+        
+        # Write block sizes (entry sizes) second
+        for entry_size in entry_sizes:
+            f.write(f"{entry_size}\n")
+
+    try:
+        # Check if the executable exists
+        if os.path.exists(buddy_executable):
+            # Run the executable with a timeout to prevent hanging
+            run_result = subprocess.run(
+                [buddy_executable],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=30,
+            )
+
+            # Parse system information from the full output
+            system_info = parse_system_info_from_output(run_result.stdout)
+            
+            # Extract just the results section for display
+            output_lines = run_result.stdout.split("\n")
+            result_section = []
+            results_found = False
+
+            for line in output_lines:
+                if line.strip() == "Results:":
+                    results_found = True
+                    result_section.append(line)
+                elif results_found:
+                    result_section.append(line)
+
+            return {
+                "results_output": "\n".join(result_section),
+                "system_info": system_info,
+                "full_output": run_result.stdout
+            }
+        else:
+            return {
+                "results_output": "BuddyAllocation executable not found. It should be compiled during the build process.",
+                "system_info": {},
+                "full_output": ""
+            }
+    except subprocess.TimeoutExpired:
+        return {
+            "results_output": "BuddyAllocation execution timed out after 30 seconds.",
+            "system_info": {},
+            "full_output": ""
+        }
+    except subprocess.CalledProcessError as e:
+        return {
+            "results_output": f"Error running BuddyAllocation: {e.stderr}",
+            "system_info": {},
+            "full_output": ""
+        }
+
 
 def calculate_percentages_and_run_buddy_for_batch(batch_result):
     """Calculate percentages for datasets within ONE batch and run buddy allocator for that batch."""
@@ -313,9 +406,9 @@ def calculate_percentages_and_run_buddy_for_batch(batch_result):
         dataset_result['weighted_value'] = float(weighted_values[i])
     
     # Run buddy allocator for this specific batch
-    buddy_output = run_buddy_allocation(percentages, entry_sizes, batch_result['batch_number'])
+    buddy_result = run_buddy_allocation(percentages, entry_sizes, batch_result['batch_number'])
     
-    return batch_result, buddy_output, percentages
+    return batch_result, buddy_result, percentages
 
 
 @app.route("/predict", methods=["POST"])
@@ -432,30 +525,50 @@ def predict():
         print("Calculating percentages and running buddy allocator for each batch...")
         final_batch_results = []
         all_buddy_outputs = []
+        system_info_from_buddy = None  # Store system info from first buddy run
         
         for batch_result in batch_results:
             print(f"Running buddy allocator for {batch_result['batch_name']}...")
-            processed_batch, buddy_output, batch_percentages = calculate_percentages_and_run_buddy_for_batch(batch_result)
+            processed_batch, buddy_result, batch_percentages = calculate_percentages_and_run_buddy_for_batch(batch_result)
+            
+            # Store system info from the first successful buddy run
+            if not system_info_from_buddy and buddy_result.get("system_info"):
+                system_info_from_buddy = buddy_result["system_info"]
             
             # Add buddy allocation info to the batch
-            processed_batch['buddy_allocation_output'] = buddy_output
+            processed_batch['buddy_allocation_output'] = buddy_result.get("results_output", "")
             processed_batch['batch_percentages'] = batch_percentages
+            processed_batch['system_info'] = buddy_result.get("system_info", {})
             
             final_batch_results.append(processed_batch)
             all_buddy_outputs.append({
                 'batch_number': processed_batch['batch_number'],
                 'batch_name': processed_batch['batch_name'],
-                'buddy_output': buddy_output,
-                'percentages': batch_percentages
+                'buddy_output': buddy_result.get("results_output", ""),
+                'percentages': batch_percentages,
+                'system_info': buddy_result.get("system_info", {}),
+                'ram_size': buddy_result.get("system_info", {}).get("TOTAL_RAM_SIZE"),
+                'ram_size_mb': buddy_result.get("system_info", {}).get("TOTAL_RAM_SIZE_MB")
             })
 
-        # Prepare final response
+        # Prepare final response with system info from buddy allocator
         response = {
             "datasets": dataset_names,
             "total_batches": len(final_batch_results),
             "batch_results": final_batch_results,
-            "all_buddy_outputs": all_buddy_outputs  # Separate buddy allocator results for each batch
+            "all_buddy_outputs": all_buddy_outputs
         }
+        
+        # Add system information from buddy allocator if available
+        if system_info_from_buddy:
+            response.update({
+                "total_ram_size": system_info_from_buddy.get("TOTAL_RAM_SIZE"),
+                "total_ram_size_mb": system_info_from_buddy.get("TOTAL_RAM_SIZE_MB"),
+                "max_block_types": system_info_from_buddy.get("MAX_BLOCK_TYPES"),
+                "iteration_count": system_info_from_buddy.get("ITERATION_COUNT"),
+                "num_threads": system_info_from_buddy.get("NUM_THREADS"),
+                "ram_size_formatted": f"{system_info_from_buddy.get('TOTAL_RAM_SIZE_MB', 0)} MB"
+            })
 
         # Force garbage collection before returning
         gc.collect()
@@ -468,8 +581,6 @@ def predict():
         print(traceback.format_exc())
         return jsonify({"error": f"Unexpected error: {str(e)}"}), 500
 
-
-# Remove the old calculate_percentages_and_run_buddy function since we're not using it anymore
 
 # Add at the very end of your app.py file
 if __name__ == "__main__":
